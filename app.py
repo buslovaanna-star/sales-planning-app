@@ -447,13 +447,24 @@ with tab3:
             st.markdown("---")
             st.markdown("**Виконання плану по магазинах**")
 
+            def color_execution(val):
+                if pd.isna(val):
+                    return ""
+                if val >= 100:
+                    return "background-color: #c8e6c9; color: #1b5e20"
+                if val >= 90:
+                    return "background-color: #fff9c4; color: #f57f17"
+                return "background-color: #ffcdd2; color: #b71c1c"
+
             st.dataframe(
-                exec_df_show[["Факт", "План", "Виконання %", "Відхилення", "Статус"]].style.format({
-                    "Факт": "{:,.0f}",
-                    "План": "{:,.0f}",
-                    "Виконання %": "{:.1f}%",
-                    "Відхилення": "{:+,.0f}",
-                }).background_gradient(subset=["Виконання %"], cmap="RdYlGn", vmin=70, vmax=130),
+                exec_df_show[["Факт", "План", "Виконання %", "Відхилення", "Статус"]].style
+                    .format({
+                        "Факт": "{:,.0f}",
+                        "План": "{:,.0f}",
+                        "Виконання %": "{:.1f}%",
+                        "Відхилення": "{:+,.0f}",
+                    })
+                    .applymap(color_execution, subset=["Виконання %"]),
                 use_container_width=True,
                 height=500,
             )
