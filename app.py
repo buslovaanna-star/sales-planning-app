@@ -464,7 +464,7 @@ with tab3:
                         "Виконання %": "{:.1f}%",
                         "Відхилення": "{:+,.0f}",
                     })
-                    .applymap(color_execution, subset=["Виконання %"]),
+                    .map(color_execution, subset=["Виконання %"]),
                 use_container_width=True,
                 height=500,
             )
