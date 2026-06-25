@@ -156,41 +156,11 @@ STATIC_PROMO_FILE = "promo_2025.xlsx"   # або "promo_2025.csv"
 
 # Посилання на Google Таблицю з акціями 2026 (відкрита для перегляду)
 # Залиште порожнім "" щоб вводити вручну у вкладці Промокалендар
-GSHEET_PROMO_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTCD09sJ5nB4z3pUHF9bbBNKv_zEMiYX48gx4gdVtRbkVJ-PFg5KXSduDDh2J79F10Kbu5724P3LA32/pub?gid=0&single=true&output=tsv"   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
+GSHEET_PROMO_URL = ""   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ── Auto-load promo calendar from repo/config (runs once per session) ─────────
-import os as _os
-if not st.session_state.get("_promo_autoloaded", False):
-    st.session_state["_promo_autoloaded"] = True
-    _frames = []
 
-    # 1. Static file from repository
-    if STATIC_PROMO_FILE:
-        _path = _os.path.join(_os.path.dirname(__file__), STATIC_PROMO_FILE)
-        if _os.path.exists(_path):
-            try:
-                _raw = (pd.read_excel(_path, header=None) if _path.endswith(".xlsx")
-                        else pd.read_csv(_path, header=None))
-                _frames.append(parse_promo_df(_raw))
-            except Exception:
-                pass
-
-    # 2. Google Sheets from config
-    if GSHEET_PROMO_URL:
-        try:
-            _frames.append(load_promo_from_gsheet(GSHEET_PROMO_URL))
-        except Exception:
-            pass
-
-    if _frames:
-        _combined = pd.concat(_frames, ignore_index=True).drop_duplicates(
-            subset=["date_start", "date_end", "promo_type"]
-        ).reset_index(drop=True)
-        st.session_state.promo_calendar       = _combined
-        st.session_state.promo_static_loaded  = True
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 def parse_promo_df(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -621,6 +591,43 @@ with st.sidebar:
             st.success("✓ План розраховано")
         else:
             st.warning("Спочатку завантажте файл")
+
+
+# ── Auto-load promo calendar (runs once per session, after all functions defined)
+import os as _os
+if not st.session_state.get("_promo_autoloaded", False):
+    st.session_state["_promo_autoloaded"] = True
+    _frames = []
+    _load_errors = []
+
+    # 1. Static file from repository
+    if STATIC_PROMO_FILE:
+        _path = _os.path.join(_os.path.dirname(__file__), STATIC_PROMO_FILE)
+        if _os.path.exists(_path):
+            try:
+                _raw = (pd.read_excel(_path, header=None) if _path.endswith(".xlsx")
+                        else pd.read_csv(_path, header=None))
+                _frames.append(parse_promo_df(_raw))
+            except Exception as _e:
+                _load_errors.append(f"Файл {STATIC_PROMO_FILE}: {_e}")
+        else:
+            _load_errors.append(f"Файл {STATIC_PROMO_FILE} не знайдено в репозиторії")
+
+    # 2. Google Sheets from config
+    if GSHEET_PROMO_URL:
+        try:
+            _frames.append(load_promo_from_gsheet(GSHEET_PROMO_URL))
+        except Exception as _e:
+            _load_errors.append(f"Google Sheets: {_e}")
+
+    if _frames:
+        _combined = pd.concat(_frames, ignore_index=True).drop_duplicates(
+            subset=["date_start", "date_end", "promo_type"]
+        ).reset_index(drop=True)
+        st.session_state.promo_calendar      = _combined
+        st.session_state.promo_static_loaded = True
+    st.session_state["_promo_load_errors"] = _load_errors
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1137,6 +1144,12 @@ with tab5:
         else:
             st.warning(f"Налаштовано джерела ({', '.join(src_parts)}), але завантаження не вдалось. "
                        f"Завантажте вручну нижче.")
+            # Show exact errors to help debug
+            _errs = st.session_state.get("_promo_load_errors", [])
+            if _errs:
+                with st.expander("Деталі помилки"):
+                    for _err in _errs:
+                        st.code(_err)
     else:
         st.info("Джерела промокалендаря не налаштовані в коді. "
                 "Завантажте вручну або додайте шлях/посилання в `STATIC_PROMO_FILE` / `GSHEET_PROMO_URL`.")
