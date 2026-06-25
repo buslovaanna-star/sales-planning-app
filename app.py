@@ -156,7 +156,7 @@ STATIC_PROMO_FILE = "promo_2025.xlsx"   # або "promo_2025.csv"
 
 # Посилання на Google Таблицю з акціями 2026 (відкрита для перегляду)
 # Залиште порожнім "" щоб вводити вручну у вкладці Промокалендар
-GSHEET_PROMO_URL = ""   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
+GSHEET_PROMO_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTCD09sJ5nB4z3pUHF9bbBNKv_zEMiYX48gx4gdVtRbkVJ-PFg5KXSduDDh2J79F10Kbu5724P3LA32/pub?gid=0&single=true&output=tsv"   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
 # ─────────────────────────────────────────────────────────────────────────────
 
 
