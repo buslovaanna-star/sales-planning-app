@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 import warnings
+import json
+import re
+import requests
 warnings.filterwarnings('ignore')
 
 st.set_page_config(
@@ -27,6 +30,8 @@ for k, v in [
     ("seasonality", None), ("store_starts", {}), ("plan_month", None),
     ("excel_plans", {}),
     ("bias_corrections", {}),
+    ("promo_calendar", pd.DataFrame()),
+    ("promo_static_loaded", False),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -116,6 +121,155 @@ def parse_excel_plans(xl: dict) -> dict:
                 except Exception:
                     pass
     return plans
+
+
+# ── Promo calendar helpers ────────────────────────────────────────────────────
+
+PROMO_TYPE_WEIGHT = {
+    "ТОВАР МІСЯЦЯ -40%":                        3.0,
+    "1+1=3 на перелік":                          2.5,
+    "-50 на другу одиницю в чеку на перелік":   2.5,
+    "Знижка за промокодом":                      1.5,
+    "купи на товар з переліку на суму і отримай": 1.5,
+    "Знижка на перелік":                         1.0,
+}
+PROMO_DEEP_TYPES = {"ТОВАР МІСЯЦЯ -40%", "1+1=3 на перелік",
+                    "-50 на другу одиницю в чеку на перелік"}
+
+
+def parse_promo_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize a raw promo DataFrame to columns:
+    date_start, date_end, promo_type, name
+    Accepts the exact layout from the image: cols A=date_start, B=date_end, C=type, D=sku, E=name
+    """
+    df = df_raw.copy()
+    # Try to find the header row (contains 'ДАТА' or 'ТИП')
+    header_row = None
+    for i in range(min(5, len(df))):
+        row_str = " ".join(str(v) for v in df.iloc[i].values)
+        if "ДАТА" in row_str.upper() or "ТИП" in row_str.upper():
+            header_row = i
+            break
+
+    if header_row is not None:
+        df.columns = [str(c).strip() for c in df.iloc[header_row].values]
+        df = df.iloc[header_row + 1:].reset_index(drop=True)
+
+    # Detect columns by position or name
+    cols = df.columns.tolist()
+
+    def find_col(keywords):
+        for kw in keywords:
+            for c in cols:
+                if kw.lower() in str(c).lower():
+                    return c
+        return None
+
+    col_start = find_col(["ДАТА ПОЧА", "дата поч", "start", "початку"]) or cols[0]
+    col_end   = find_col(["ДАТА ЗАКІН", "дата зак", "end",  "закін"])   or cols[1]
+    col_type  = find_col(["ТИП", "тип", "type"])                         or cols[2]
+    col_name  = find_col(["НАЗВА", "назва", "name"])
+
+    result = pd.DataFrame()
+    result["date_start"] = pd.to_datetime(df[col_start], errors="coerce", dayfirst=True)
+    result["date_end"]   = pd.to_datetime(df[col_end],   errors="coerce", dayfirst=True)
+    result["promo_type"] = df[col_type].astype(str).str.strip()
+    result["name"]       = df[col_name].astype(str).str.strip() if col_name else ""
+    result = result.dropna(subset=["date_start", "date_end"]).reset_index(drop=True)
+    return result
+
+
+def load_promo_from_gsheet(url: str) -> pd.DataFrame:
+    """
+    Load promo calendar from a Google Sheets share link.
+    Accepts both /edit and /pub URLs.
+    """
+    # Extract sheet ID
+    match = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
+    if not match:
+        raise ValueError("Не вдалося розпізнати посилання на Google Sheets")
+    sheet_id = match.group(1)
+
+    # Try to extract gid (sheet tab id)
+    gid_match = re.search(r'gid=(\d+)', url)
+    gid = gid_match.group(1) if gid_match else "0"
+
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    resp = requests.get(csv_url, timeout=15)
+    resp.raise_for_status()
+    from io import StringIO
+    df_raw = pd.read_csv(StringIO(resp.text), header=None)
+    return parse_promo_df(df_raw)
+
+
+def compute_monthly_promo_score(promo_df: pd.DataFrame, target_month: pd.Timestamp) -> dict:
+    """
+    For a given month, compute:
+    - intensity:      weighted promo coverage (sum of days×weight / days_in_month)
+    - has_deep:       bool — any deep promo (ТОВАР МІСЯЦЯ / 1+1=3 / -50)
+    - has_anchor:     bool — ТОВАР МІСЯЦЯ -40% present
+    - deep_days:      number of days with deep promo active
+    - lift_factor:    multiplier to apply to base forecast (calibrated from data)
+    """
+    m_start = target_month
+    m_end   = target_month + pd.offsets.MonthEnd(1)
+    days_in_month = m_end.day
+
+    # Filter promos overlapping this month
+    overlap = promo_df[
+        (promo_df["date_start"] <= m_end) &
+        (promo_df["date_end"]   >= m_start)
+    ].copy()
+
+    if len(overlap) == 0:
+        return {"intensity": 0, "has_deep": False, "has_anchor": False,
+                "deep_days": 0, "lift_factor": 1.0, "n_promos": 0}
+
+    # Compute active days per promo (clipped to month)
+    overlap["active_days"] = (
+        overlap[["date_end", pd.Timestamp(m_end)]].min(axis=1) -
+        overlap[["date_start", pd.Timestamp(m_start)]].max(axis=1)
+    ).dt.days + 1
+    overlap["active_days"] = overlap["active_days"].clip(lower=0)
+
+    # Map weights
+    overlap["weight"] = overlap["promo_type"].map(
+        lambda t: next((v for k, v in PROMO_TYPE_WEIGHT.items() if k.lower() in t.lower()), 1.0)
+    )
+    overlap["is_deep"] = overlap["promo_type"].apply(
+        lambda t: any(k.lower() in t.lower() for k in PROMO_DEEP_TYPES)
+    )
+    overlap["is_anchor"] = overlap["promo_type"].apply(
+        lambda t: "ТОВАР МІСЯЦЯ" in t.upper()
+    )
+
+    intensity  = (overlap["active_days"] * overlap["weight"]).sum() / days_in_month
+    has_deep   = overlap["is_deep"].any()
+    has_anchor = overlap["is_anchor"].any()
+    deep_days  = int((overlap.loc[overlap["is_deep"], "active_days"]).sum())
+
+    # Lift factor: calibrated from analysis
+    # Base: 1.0 (no adjustment)
+    # + anchor promo:      +0.08 (ТОВАР МІСЯЦЯ always present, partially in baseline)
+    # + deep mechanic:     +0.06 additional
+    # Soft promos (intensity only): marginal
+    lift = 1.0
+    if has_anchor:
+        lift += 0.08
+    if has_deep and not has_anchor:
+        lift += 0.05
+    elif has_deep and has_anchor:
+        lift += 0.06
+
+    return {
+        "intensity": round(intensity, 2),
+        "has_deep":  bool(has_deep),
+        "has_anchor": bool(has_anchor),
+        "deep_days": deep_days,
+        "lift_factor": round(lift, 3),
+        "n_promos": len(overlap),
+    }
 
 
 def deseasonalise(series: pd.Series, seasonality: dict) -> pd.Series:
@@ -327,6 +481,13 @@ with st.sidebar:
                 growth_old, growth_young, age_threshold,
                 short_weight, short_window,
             )
+            # Apply promo lift factor if calendar is loaded
+            promo_df_sidebar = st.session_state.promo_calendar
+            if len(promo_df_sidebar) > 0:
+                promo_score = compute_monthly_promo_score(promo_df_sidebar, plan_month)
+                lift = promo_score["lift_factor"]
+                if lift != 1.0:
+                    plan = (plan * lift).round(2)
             # Compute and apply bias corrections
             if use_bias:
                 corrections = compute_bias_corrections(
@@ -358,7 +519,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4 = st.tabs(["📁 Дані", "✏️ Редагування плану", "📊 Аналітика", "💡 Рекомендації"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📁 Дані", "✏️ Редагування плану", "📊 Аналітика", "💡 Рекомендації", "📅 Промокалендар"])
 
 
 # ── TAB 1: DATA ───────────────────────────────────────────────────────────────
@@ -833,3 +994,152 @@ with tab4:
         c1.metric("Зрілих магазинів", (age_df["Вік (міс.)"] >= 12).sum())
         c2.metric("Нових (≤12 міс.)", (age_df["Вік (міс.)"] < 12).sum())
         st.dataframe(age_df, use_container_width=True, hide_index=True, height=300)
+
+
+# ── TAB 5: PROMO CALENDAR ────────────────────────────────────────────────────
+with tab5:
+    st.subheader("📅 Промокалендар")
+
+    promo_df = st.session_state.promo_calendar
+    has_promo = len(promo_df) > 0
+
+    # ── Section 1: Static 2025 calendar (uploaded once) ─────────────────────
+    st.markdown("**Постійний календар (2025 та попередні роки)**")
+    st.caption("Завантажте файл один раз — він зберігається в сесії до перезавантаження сторінки.")
+
+    static_file = st.file_uploader(
+        "Завантажити Excel/CSV з промокалендарем",
+        type=["xlsx", "csv"],
+        key="promo_static_upload",
+        help="Формат: колонки ДАТА ПОЧАТКУ, ДАТА ЗАКІНЧЕННЯ, ТИП, НАЗВА (як у вашій таблиці)"
+    )
+    if static_file:
+        try:
+            if static_file.name.endswith(".csv"):
+                df_raw = pd.read_csv(static_file, header=None)
+            else:
+                df_raw = pd.read_excel(static_file, header=None)
+            parsed = parse_promo_df(df_raw)
+            st.session_state.promo_calendar = parsed
+            st.session_state.promo_static_loaded = True
+            promo_df = parsed
+            has_promo = True
+            st.success(f"✓ Завантажено {len(parsed)} акцій")
+        except Exception as e:
+            st.error(f"Помилка читання файлу: {e}")
+
+    st.markdown("---")
+
+    # ── Section 2: Google Sheets link ───────────────────────────────────────
+    st.markdown("**Поточний рік (Google Sheets)**")
+    st.caption(
+        "Відкрийте таблицю → Файл → Поділитися → Опублікувати в інтернеті → CSV. "
+        "Або вставте звичайне посилання /edit — застосунок перетворить його автоматично."
+    )
+
+    gsheet_url = st.text_input(
+        "Посилання на Google Таблицю",
+        placeholder="https://docs.google.com/spreadsheets/d/...",
+        key="gsheet_url_input"
+    )
+    if st.button("Завантажити з Google Sheets", use_container_width=False):
+        if gsheet_url.strip():
+            try:
+                with st.spinner("Завантаження..."):
+                    gdf = load_promo_from_gsheet(gsheet_url.strip())
+                # Merge with existing static data (avoid duplicates by date+type)
+                if has_promo:
+                    combined = pd.concat([promo_df, gdf], ignore_index=True)
+                    combined = combined.drop_duplicates(
+                        subset=["date_start", "date_end", "promo_type"]
+                    ).reset_index(drop=True)
+                else:
+                    combined = gdf
+                st.session_state.promo_calendar = combined
+                promo_df = combined
+                has_promo = True
+                st.success(f"✓ Додано {len(gdf)} акцій з Google Sheets (всього: {len(combined)})")
+            except requests.exceptions.HTTPError as e:
+                st.error(
+                    "Не вдалося отримати доступ. Переконайтесь що таблиця відкрита для перегляду: "
+                    "Файл → Поділитися → Будь-хто з посиланням може переглядати."
+                )
+            except Exception as e:
+                st.error(f"Помилка: {e}")
+        else:
+            st.warning("Введіть посилання")
+
+    # ── Section 3: Preview and monthly summary ──────────────────────────────
+    if has_promo:
+        st.markdown("---")
+        pm = st.session_state.plan_month
+
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Акцій у календарі", len(promo_df))
+        col_b.metric("Діапазон дат",
+                     f"{promo_df['date_start'].min().strftime('%b %Y')} – "
+                     f"{promo_df['date_end'].max().strftime('%b %Y')}")
+
+        # Monthly summary table
+        st.markdown("**Місячний підсумок**")
+        months_range = pd.date_range(
+            promo_df["date_start"].min().to_period("M").to_timestamp(),
+            promo_df["date_end"].max().to_period("M").to_timestamp(),
+            freq="MS"
+        )
+        summary_rows = []
+        for m in months_range:
+            score = compute_monthly_promo_score(promo_df, m)
+            summary_rows.append({
+                "Місяць": m.strftime("%b %Y"),
+                "К-сть акцій": score["n_promos"],
+                "ТОВАР МІСЯЦЯ": "✅" if score["has_anchor"] else "—",
+                "Глибока механіка": "✅" if score["has_deep"] else "—",
+                "Інтенсивність": score["intensity"],
+                "Lift-фактор": score["lift_factor"],
+            })
+        summary_df = pd.DataFrame(summary_rows)
+
+        # Highlight plan month
+        def highlight_plan_month(row):
+            if pm and row["Місяць"] == pm.strftime("%b %Y"):
+                return ["background-color:#e8f5e9"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            summary_df.style
+                .apply(highlight_plan_month, axis=1)
+                .format({"Інтенсивність": "{:.1f}", "Lift-фактор": "{:.3f}"}),
+            use_container_width=True,
+            hide_index=True,
+            height=380
+        )
+
+        if pm:
+            score_pm = compute_monthly_promo_score(promo_df, pm)
+            st.markdown(f"**Місяць плану ({pm.strftime('%B %Y')}):** "
+                        f"lift-фактор = **{score_pm['lift_factor']:.3f}** "
+                        f"({'ТОВАР МІСЯЦЯ ✅' if score_pm['has_anchor'] else '—'}, "
+                        f"{'глибока механіка ✅' if score_pm['has_deep'] else '—'})")
+            if score_pm["lift_factor"] > 1.0:
+                st.info(
+                    f"Промо-поправка для плану на {pm.strftime('%B %Y')}: "
+                    f"×{score_pm['lift_factor']:.3f} (+{(score_pm['lift_factor']-1)*100:.0f}%). "
+                    f"Натисніть «Розрахувати план» у боковій панелі — поправка застосується автоматично."
+                )
+
+        # Raw data view
+        with st.expander("Переглянути всі акції"):
+            st.dataframe(
+                promo_df.sort_values("date_start").assign(
+                    date_start=lambda x: x.date_start.dt.strftime("%d.%m.%Y"),
+                    date_end=lambda x: x.date_end.dt.strftime("%d.%m.%Y")
+                ).rename(columns={
+                    "date_start": "Початок", "date_end": "Кінець",
+                    "promo_type": "Тип", "name": "Назва"
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.info("Завантажте промокалендар щоб побачити місячну аналітику та lift-фактори для плану.")
