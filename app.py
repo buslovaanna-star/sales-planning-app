@@ -156,7 +156,7 @@ STATIC_PROMO_FILE = "promo_2025.xlsx"   # або "promo_2025.csv"
 
 # Посилання на Google Таблицю з акціями 2026 (відкрита для перегляду)
 # Залиште порожнім "" щоб вводити вручну у вкладці Промокалендар
-GSHEET_PROMO_URL = "https://docs.google.com/spreadsheets/d/1D1wI3WF3sc8zaJLU0TqD_wENhTRRWeLOSf0JKTbC8co/edit?pli=1&gid=0#gid=0"   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
+GSHEET_PROMO_URL = ""   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -250,25 +250,51 @@ def parse_promo_df(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def load_promo_from_gsheet(url: str) -> pd.DataFrame:
     """
-    Load promo calendar from a Google Sheets share link.
-    Accepts both /edit and /pub URLs.
+    Load promo calendar from a Google Sheets link.
+    Tries multiple URL formats:
+    1. /pub?output=csv  (published CSV — most reliable)
+    2. /export?format=csv  (share link export)
     """
+    from io import StringIO
+
+    url = url.strip()
+
     # Extract sheet ID
     match = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
     if not match:
         raise ValueError("Не вдалося розпізнати посилання на Google Sheets")
     sheet_id = match.group(1)
 
-    # Try to extract gid (sheet tab id)
-    gid_match = re.search(r'gid=(\d+)', url)
+    # Extract gid (tab id) — only from query string, not fragment
+    gid_match = re.search(r'[?&]gid=(\d+)', url)
     gid = gid_match.group(1) if gid_match else "0"
 
-    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    resp = requests.get(csv_url, timeout=15)
-    resp.raise_for_status()
-    from io import StringIO
-    df_raw = pd.read_csv(StringIO(resp.text), header=None)
-    return parse_promo_df(df_raw)
+    # Build candidate URLs to try in order
+    candidates = [
+        # 1. Already a pub CSV link
+        url if "pub?output=csv" in url or "pub?gid" in url else None,
+        # 2. Published CSV export
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/pub?output=csv&gid={gid}",
+        # 3. Standard export
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}",
+    ]
+    candidates = [c for c in candidates if c]
+
+    last_err = None
+    for csv_url in candidates:
+        try:
+            resp = requests.get(csv_url, timeout=20, allow_redirects=True)
+            if resp.status_code == 200 and "text/html" not in resp.headers.get("Content-Type",""):
+                df_raw = pd.read_csv(StringIO(resp.text), header=None)
+                return parse_promo_df(df_raw)
+        except Exception as e:
+            last_err = e
+
+    raise ValueError(
+        "Не вдалося завантажити таблицю. Переконайтесь що вона опублікована: "
+        "Файл → Поділитися → Опублікувати в інтернеті → CSV. "
+        f"Остання помилка: {last_err}"
+    )
 
 
 def compute_monthly_promo_score(promo_df: pd.DataFrame, target_month: pd.Timestamp) -> dict:
