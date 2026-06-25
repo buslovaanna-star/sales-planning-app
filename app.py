@@ -156,7 +156,7 @@ STATIC_PROMO_FILE = "promo_2025.xlsx"   # або "promo_2025.csv"
 
 # Посилання на Google Таблицю з акціями 2026 (відкрита для перегляду)
 # Залиште порожнім "" щоб вводити вручну у вкладці Промокалендар
-GSHEET_PROMO_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTCD09sJ5nB4z3pUHF9bbBNKv_zEMiYX48gx4gdVtRbkVJ-PFg5KXSduDDh2J79F10Kbu5724P3LA32/pub?gid=0&single=true&output=tsv"   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
+GSHEET_PROMO_URL = ""   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -478,18 +478,36 @@ def color_exec(val):
     return "background-color:#ffcdd2;color:#b71c1c"
 
 
-def to_excel(df_fact, plan_auto, plan_edited, plan_month):
+def to_excel(df_fact, plan_auto, plan_edited, plan_month, bias_corrections=None):
     buf = BytesIO()
+    month_str = plan_month.strftime("%Y-%m") if hasattr(plan_month, "strftime") else str(plan_month)[:7]
+
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        if df_fact is not None:
-            df_fact.reset_index().to_excel(w, sheet_name="Факт", index=False)
+        # Sheet 1: Plan
         if plan_auto is not None:
-            pd.DataFrame({
-                "Магазин": plan_auto.index,
-                "Авто-план": plan_auto.values,
-                "Відред. план": plan_edited.values if plan_edited is not None else plan_auto.values,
-                "Місяць": str(plan_month)[:7],
-            }).to_excel(w, sheet_name="План", index=False)
+            plan_df = pd.DataFrame(index=plan_auto.index)
+            plan_df.index.name = "Магазин"
+            plan_df["Авто-план (до корекції)"] = plan_auto.values.round(0).astype(int)
+            if bias_corrections:
+                plan_df["Bias MPE %"] = [
+                    round(bias_corrections.get(s, 0.0) * 100, 1)
+                    for s in plan_auto.index
+                ]
+            plan_df["Ваш план"] = (
+                plan_edited.values.round(0).astype(int)
+                if plan_edited is not None
+                else plan_auto.values.round(0).astype(int)
+            )
+            plan_df["Місяць"] = month_str
+            plan_df.reset_index().to_excel(w, sheet_name="План", index=False)
+
+        # Sheet 2: Fact (only rows with data, no zeros)
+        if df_fact is not None:
+            fact_out = df_fact.replace(0, np.nan).dropna(how="all").copy()
+            fact_out.index = fact_out.index.strftime("%Y-%m-%d")
+            fact_out.index.name = "Дата"
+            fact_out.reset_index().to_excel(w, sheet_name="Факт", index=False)
+
     buf.seek(0)
     return buf
 
@@ -806,7 +824,8 @@ with tab2:
                   delta_color="normal" if delta >= 0 else "inverse")
 
         st.markdown("---")
-        buf = to_excel(df, plan_auto, st.session_state.df_plan_edited, pm)
+        buf = to_excel(df, plan_auto, st.session_state.df_plan_edited, pm,
+                      bias_corrections=st.session_state.bias_corrections)
         st.download_button("⬇️ Завантажити план у Excel", data=buf,
                            file_name=f"план_{pm.strftime('%Y_%m')}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
