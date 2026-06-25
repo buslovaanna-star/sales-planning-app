@@ -227,11 +227,9 @@ def compute_monthly_promo_score(promo_df: pd.DataFrame, target_month: pd.Timesta
                 "deep_days": 0, "lift_factor": 1.0, "n_promos": 0}
 
     # Compute active days per promo (clipped to month)
-    overlap["active_days"] = (
-        overlap[["date_end", pd.Timestamp(m_end)]].min(axis=1) -
-        overlap[["date_start", pd.Timestamp(m_start)]].max(axis=1)
-    ).dt.days + 1
-    overlap["active_days"] = overlap["active_days"].clip(lower=0)
+    clipped_end   = overlap["date_end"].clip(upper=m_end)
+    clipped_start = overlap["date_start"].clip(lower=m_start)
+    overlap["active_days"] = ((clipped_end - clipped_start).dt.days + 1).clip(lower=0)
 
     # Map weights
     overlap["weight"] = overlap["promo_type"].map(
