@@ -36,36 +36,7 @@ for k, v in [
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Auto-load promo calendar from repo/config (runs once per session) ─────────
-if not st.session_state.get("_promo_autoloaded", False):
-    st.session_state["_promo_autoloaded"] = True
-    _frames = []
 
-    # 1. Static file from repository
-    if STATIC_PROMO_FILE:
-        import os
-        _path = os.path.join(os.path.dirname(__file__), STATIC_PROMO_FILE)
-        if os.path.exists(_path):
-            try:
-                _raw = pd.read_excel(_path, header=None) if _path.endswith(".xlsx")                        else pd.read_csv(_path, header=None)
-                _frames.append(parse_promo_df(_raw))
-            except Exception:
-                pass
-
-    # 2. Google Sheets from config
-    if GSHEET_PROMO_URL:
-        try:
-            _frames.append(load_promo_from_gsheet(GSHEET_PROMO_URL))
-        except Exception:
-            pass
-
-    if _frames:
-        _combined = pd.concat(_frames, ignore_index=True).drop_duplicates(
-            subset=["date_start", "date_end", "promo_type"]
-        ).reset_index(drop=True)
-        st.session_state.promo_calendar  = _combined
-        st.session_state.promo_static_loaded = True
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 # ── Core helpers ──────────────────────────────────────────────────────────────
@@ -176,6 +147,39 @@ STATIC_PROMO_FILE = "promo_2025.xlsx"   # або "promo_2025.csv"
 # Залиште порожнім "" щоб вводити вручну у вкладці Промокалендар
 GSHEET_PROMO_URL = ""   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Auto-load promo calendar from repo/config (runs once per session) ─────────
+import os as _os
+if not st.session_state.get("_promo_autoloaded", False):
+    st.session_state["_promo_autoloaded"] = True
+    _frames = []
+
+    # 1. Static file from repository
+    if STATIC_PROMO_FILE:
+        _path = _os.path.join(_os.path.dirname(__file__), STATIC_PROMO_FILE)
+        if _os.path.exists(_path):
+            try:
+                _raw = (pd.read_excel(_path, header=None) if _path.endswith(".xlsx")
+                        else pd.read_csv(_path, header=None))
+                _frames.append(parse_promo_df(_raw))
+            except Exception:
+                pass
+
+    # 2. Google Sheets from config
+    if GSHEET_PROMO_URL:
+        try:
+            _frames.append(load_promo_from_gsheet(GSHEET_PROMO_URL))
+        except Exception:
+            pass
+
+    if _frames:
+        _combined = pd.concat(_frames, ignore_index=True).drop_duplicates(
+            subset=["date_start", "date_end", "promo_type"]
+        ).reset_index(drop=True)
+        st.session_state.promo_calendar       = _combined
+        st.session_state.promo_static_loaded  = True
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def parse_promo_df(df_raw: pd.DataFrame) -> pd.DataFrame:
