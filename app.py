@@ -127,16 +127,27 @@ def parse_excel_plans(xl: dict) -> dict:
 
 # ── Promo calendar helpers ────────────────────────────────────────────────────
 
+# Weights matched by substring — order matters (more specific first)
 PROMO_TYPE_WEIGHT = {
-    "ТОВАР МІСЯЦЯ -40%":                        3.0,
-    "1+1=3 на перелік":                          2.5,
-    "-50 на другу одиницю в чеку на перелік":   2.5,
-    "Знижка за промокодом":                      1.5,
-    "купи на товар з переліку на суму і отримай": 1.5,
-    "Знижка на перелік":                         1.0,
+    "ТОВАР МІСЯЦЯ":           3.0,   # ТОВАР МІСЯЦЯ / ТОВАР МІСЯЦЯ МАГАЗИНИ / САЙТ
+    "1+1=3":                  2.5,   # 1+1=3 та товари / 2=3 та товари
+    "2=3":                    2.5,
+    "-50":                    2.5,   # -50 на другу одиницю
+    "чорна п'ятниця":         3.0,   # Black Friday
+    "ніч знижок":             2.0,
+    "25%":                    2.0,   # глибокі знижки ≥25%
+    "40%":                    2.5,
+    "промокод":               1.5,
+    "знижка":                 1.0,
+    "акція":                  1.0,
+    "день":                   0.8,   # День матері, День Києва тощо
+    "тиждень":                1.2,   # MY NUTRI WEEK
+    "розсилка":               0.3,   # не впливає на продажі магазину
+    "банер":                  0.3,
+    "промо":                  0.5,
 }
-PROMO_DEEP_TYPES = {"ТОВАР МІСЯЦЯ -40%", "1+1=3 на перелік",
-                    "-50 на другу одиницю в чеку на перелік"}
+PROMO_DEEP_TYPES = {"ТОВАР МІСЯЦЯ", "1+1=3", "2=3", "-50",
+                    "чорна п'ятниця", "40%"}
 
 # ── Hardcoded config (set once, never needs UI) ───────────────────────────────
 # Файл з акціями за 2025 рік у репозиторії (відносний шлях від app.py)
@@ -186,22 +197,26 @@ def parse_promo_df(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize a raw promo DataFrame to columns:
     date_start, date_end, promo_type, name
-    Accepts the exact layout from the image: cols A=date_start, B=date_end, C=type, D=sku, E=name
+    Accepts the exact layout: cols A=date_start, B=date_end, C=type, D=sku, E=name
+    Row 0 may be a header or data.
     """
     df = df_raw.copy()
-    # Try to find the header row (contains 'ДАТА' or 'ТИП')
+
+    # Detect header row: first row where col 0 is text (not a date)
     header_row = None
     for i in range(min(5, len(df))):
-        row_str = " ".join(str(v) for v in df.iloc[i].values)
-        if "ДАТА" in row_str.upper() or "ТИП" in row_str.upper():
-            header_row = i
-            break
+        val = df.iloc[i, 0]
+        if isinstance(val, str) and len(val) > 2:
+            try:
+                pd.to_datetime(val, dayfirst=True)
+            except Exception:
+                header_row = i
+                break
 
     if header_row is not None:
         df.columns = [str(c).strip() for c in df.iloc[header_row].values]
         df = df.iloc[header_row + 1:].reset_index(drop=True)
 
-    # Detect columns by position or name
     cols = df.columns.tolist()
 
     def find_col(keywords):
@@ -211,17 +226,25 @@ def parse_promo_df(df_raw: pd.DataFrame) -> pd.DataFrame:
                     return c
         return None
 
-    col_start = find_col(["ДАТА ПОЧА", "дата поч", "start", "початку"]) or cols[0]
-    col_end   = find_col(["ДАТА ЗАКІН", "дата зак", "end",  "закін"])   or cols[1]
-    col_type  = find_col(["ТИП", "тип", "type"])                         or cols[2]
-    col_name  = find_col(["НАЗВА", "назва", "name"])
+    col_start = find_col(["поча", "start"]) or cols[0]
+    col_end   = find_col(["закін", "end"])   or cols[1]
+    col_type  = find_col(["тип", "type"])    or cols[2]
+    col_name  = find_col(["назва", "name"])
 
     result = pd.DataFrame()
     result["date_start"] = pd.to_datetime(df[col_start], errors="coerce", dayfirst=True)
     result["date_end"]   = pd.to_datetime(df[col_end],   errors="coerce", dayfirst=True)
     result["promo_type"] = df[col_type].astype(str).str.strip()
     result["name"]       = df[col_name].astype(str).str.strip() if col_name else ""
-    result = result.dropna(subset=["date_start", "date_end"]).reset_index(drop=True)
+
+    # Fill missing date_end with date_start (one-day events)
+    result["date_end"] = result["date_end"].fillna(result["date_start"])
+
+    # Drop rows where we have no date at all, or type is empty/nan
+    result = result[
+        result["date_start"].notna() &
+        ~result["promo_type"].isin(["nan", "", "None"])
+    ].reset_index(drop=True)
     return result
 
 
@@ -277,15 +300,20 @@ def compute_monthly_promo_score(promo_df: pd.DataFrame, target_month: pd.Timesta
     overlap["active_days"] = ((clipped_end - clipped_start).dt.days + 1).clip(lower=0)
 
     # Map weights
-    overlap["weight"] = overlap["promo_type"].map(
-        lambda t: next((v for k, v in PROMO_TYPE_WEIGHT.items() if k.lower() in t.lower()), 1.0)
-    )
-    overlap["is_deep"] = overlap["promo_type"].apply(
-        lambda t: any(k.lower() in t.lower() for k in PROMO_DEEP_TYPES)
-    )
-    overlap["is_anchor"] = overlap["promo_type"].apply(
-        lambda t: "ТОВАР МІСЯЦЯ" in t.upper()
-    )
+    def _weight(t):
+        t_lo = t.lower()
+        for k, v in PROMO_TYPE_WEIGHT.items():
+            if k.lower() in t_lo:
+                return v
+        return 0.5  # unknown type → minimal weight
+
+    def _is_deep(t):
+        t_lo = t.lower()
+        return any(k.lower() in t_lo for k in PROMO_DEEP_TYPES)
+
+    overlap["weight"]    = overlap["promo_type"].map(_weight)
+    overlap["is_deep"]   = overlap["promo_type"].map(_is_deep)
+    overlap["is_anchor"] = overlap["promo_type"].str.upper().str.contains("ТОВАР МІСЯЦЯ", na=False)
 
     intensity  = (overlap["active_days"] * overlap["weight"]).sum() / days_in_month
     has_deep   = overlap["is_deep"].any()
