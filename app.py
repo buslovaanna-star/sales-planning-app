@@ -26,6 +26,7 @@ for k, v in [
     ("df_fact", None), ("df_plan_auto", None), ("df_plan_edited", None),
     ("seasonality", None), ("store_starts", {}), ("plan_month", None),
     ("excel_plans", {}),
+    ("bias_corrections", {}),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -184,6 +185,46 @@ def compute_auto_plan(df, store_starts, seasonality, target_month,
     })
 
 
+def compute_bias_corrections(df: pd.DataFrame, store_starts: dict,
+                              seasonality: dict, target_month: pd.Timestamp,
+                              excel_plans: dict,
+                              lookback_months: int = 12,
+                              short_weight: float = 0.5,
+                              short_window: int = 6) -> dict:
+    """
+    For each store, compute MPE = mean((fact - app_plan) / app_plan) over the last
+    lookback_months where both fact and app_plan are available.
+    Uses excel_plans where available, falls back to app auto-plan.
+    Returns dict: store_name -> bias_correction_factor (e.g. 0.05 means +5%)
+    """
+    has_data = df.replace(0, np.nan).dropna(how="all")
+    avail = [m for m in has_data.index if m < target_month]
+    months = avail[-lookback_months:] if len(avail) >= lookback_months else avail
+
+    corrections = {}
+    for store in df.columns:
+        mpes = []
+        for month in months:
+            fact_v = df.loc[month, store] if month in df.index else 0
+            if pd.isna(fact_v) or fact_v == 0:
+                continue
+            # Use excel plan if available, else app plan
+            plan_v = excel_plans.get((store, month), 0)
+            if plan_v == 0:
+                hist = df[df.index < month]
+                p = compute_auto_plan(hist, store_starts, seasonality, month,
+                                      growth_old=0.0, growth_young=0.15,
+                                      age_threshold=12,
+                                      short_weight=short_weight,
+                                      short_window=short_window)
+                plan_v = p.get(store, 0)
+            if plan_v > 0:
+                mpes.append((fact_v - plan_v) / plan_v)
+        if len(mpes) >= 3:
+            corrections[store] = float(np.mean(mpes))
+    return corrections
+
+
 def execution_table(fact: pd.Series, plan: pd.Series) -> pd.DataFrame:
     df = pd.DataFrame({"Факт": fact, "План": plan})
     df["Виконання %"] = np.where(df["План"] > 0,
@@ -267,6 +308,17 @@ with st.sidebar:
     ) / 100
     short_window = st.slider("Вікно короткого тренду (міс.)", 3, 12, 6, 1)
 
+    st.markdown("---")
+    st.markdown("**Корекція зміщення (bias)**")
+    use_bias = st.toggle(
+        "Застосувати bias correction",
+        value=True,
+        help="Коригує план на основі середнього MPE кожного магазину за останній рік.\n"
+             "Якщо магазин стабільно недовиконує план на 10% → план знижується на 10%."
+    )
+    bias_lookback = st.slider("Період для розрахунку MPE (міс.)", 6, 24, 12, 1,
+                              disabled=not use_bias)
+
     if st.button("🤖 Розрахувати план", type="primary", use_container_width=True):
         if st.session_state.df_fact is not None:
             plan = compute_auto_plan(
@@ -275,6 +327,27 @@ with st.sidebar:
                 growth_old, growth_young, age_threshold,
                 short_weight, short_window,
             )
+            # Compute and apply bias corrections
+            if use_bias:
+                corrections = compute_bias_corrections(
+                    st.session_state.df_fact,
+                    st.session_state.store_starts,
+                    st.session_state.seasonality,
+                    plan_month,
+                    st.session_state.excel_plans,
+                    lookback_months=bias_lookback,
+                    short_weight=short_weight,
+                    short_window=short_window,
+                )
+                st.session_state.bias_corrections = corrections
+                corrected = {}
+                for store in plan.index:
+                    corr = corrections.get(store, 0.0)
+                    corrected[store] = round(plan[store] * (1 + corr), 2)
+                plan = pd.Series(corrected)
+            else:
+                st.session_state.bias_corrections = {}
+
             st.session_state.df_plan_auto   = plan
             st.session_state.df_plan_edited = plan.copy()
             st.success("✓ План розраховано")
@@ -402,18 +475,49 @@ with tab2:
         st.markdown("---")
         st.markdown("**Ручне редагування по кожному магазину**")
 
-        edit_df = pd.DataFrame({
+        corrections = st.session_state.bias_corrections
+        has_bias = len(corrections) > 0
+
+        # Build edit table — add bias column when corrections are present
+        edit_data = {
             "Магазин": plan_auto.index,
             "Авто-план": plan_auto.values.round(2),
-            "Ваш план": st.session_state.df_plan_edited.values.round(2),
-        }).set_index("Магазин")
+        }
+        if has_bias:
+            edit_data["Bias MPE %"] = [
+                round(corrections.get(s, 0.0) * 100, 1) for s in plan_auto.index
+            ]
+        edit_data["Ваш план"] = st.session_state.df_plan_edited.values.round(2)
+
+        edit_df = pd.DataFrame(edit_data).set_index("Магазин")
+
+        col_config = {
+            "Авто-план": st.column_config.NumberColumn(
+                "Авто-план (до корекції)" if has_bias else "Авто-план",
+                disabled=True, format="%.0f"
+            ),
+            "Ваш план": st.column_config.NumberColumn("Ваш план ✏️", format="%.0f", min_value=0),
+        }
+        if has_bias:
+            col_config["Bias MPE %"] = st.column_config.NumberColumn(
+                "Bias MPE %",
+                disabled=True,
+                format="%.1f%%",
+                help="Середнє відхилення факту від плану за обраний період. "
+                     "Негативне = план завищений, позитивне = план занижений."
+            )
+
+        if has_bias:
+            n_corrected = sum(1 for v in corrections.values() if abs(v) >= 0.03)
+            st.caption(
+                f"✅ Bias correction активна — скориговано {n_corrected} магазинів "
+                f"(|MPE| ≥ 3%). Колонка «Авто-план» показує план ДО корекції, "
+                f"«Ваш план» — вже з поправкою."
+            )
 
         edited = st.data_editor(
             edit_df, use_container_width=True,
-            column_config={
-                "Авто-план": st.column_config.NumberColumn("Авто-план", disabled=True, format="%.0f"),
-                "Ваш план":  st.column_config.NumberColumn("Ваш план ✏️", format="%.0f", min_value=0),
-            },
+            column_config=col_config,
             height=550,
         )
         st.session_state.df_plan_edited = pd.Series(edited["Ваш план"].values, index=edited.index)
