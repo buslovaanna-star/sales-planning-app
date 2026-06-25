@@ -344,23 +344,32 @@ def compute_bias_corrections(df: pd.DataFrame, store_starts: dict,
                               short_weight: float = 0.5,
                               short_window: int = 6) -> dict:
     """
-    For each store, compute MPE = mean((fact - app_plan) / app_plan) over the last
-    lookback_months where both fact and app_plan are available.
-    Uses excel_plans where available, falls back to app auto-plan.
-    Returns dict: store_name -> bias_correction_factor (e.g. 0.05 means +5%)
+    Compute MPE per store. Rules:
+    - Only mature stores (age >= 12 months at target_month)
+    - Only months where plan_v >= 1000 (skip near-zero bootstrap plans)
+    - Require >= 3 valid observations
+    - Cap correction at +-25%
     """
+    MAX_CORR = 0.25
+    MIN_PLAN = 1000
+
     has_data = df.replace(0, np.nan).dropna(how="all")
     avail = [m for m in has_data.index if m < target_month]
     months = avail[-lookback_months:] if len(avail) >= lookback_months else avail
 
     corrections = {}
     for store in df.columns:
+        start = store_starts.get(store)
+        if start is None:
+            continue
+        age_at_target = (target_month.year - start.year) * 12 + (target_month.month - start.month)
+        if age_at_target < 12:
+            continue
         mpes = []
         for month in months:
             fact_v = df.loc[month, store] if month in df.index else 0
             if pd.isna(fact_v) or fact_v == 0:
                 continue
-            # Use excel plan if available, else app plan
             plan_v = excel_plans.get((store, month), 0)
             if plan_v == 0:
                 hist = df[df.index < month]
@@ -370,10 +379,11 @@ def compute_bias_corrections(df: pd.DataFrame, store_starts: dict,
                                       short_weight=short_weight,
                                       short_window=short_window)
                 plan_v = p.get(store, 0)
-            if plan_v > 0:
+            if plan_v >= MIN_PLAN:
                 mpes.append((fact_v - plan_v) / plan_v)
         if len(mpes) >= 3:
-            corrections[store] = float(np.mean(mpes))
+            raw = float(np.mean(mpes))
+            corrections[store] = max(-MAX_CORR, min(MAX_CORR, raw))
     return corrections
 
 
