@@ -36,6 +36,37 @@ for k, v in [
     if k not in st.session_state:
         st.session_state[k] = v
 
+# ── Auto-load promo calendar from repo/config (runs once per session) ─────────
+if not st.session_state.get("_promo_autoloaded", False):
+    st.session_state["_promo_autoloaded"] = True
+    _frames = []
+
+    # 1. Static file from repository
+    if STATIC_PROMO_FILE:
+        import os
+        _path = os.path.join(os.path.dirname(__file__), STATIC_PROMO_FILE)
+        if os.path.exists(_path):
+            try:
+                _raw = pd.read_excel(_path, header=None) if _path.endswith(".xlsx")                        else pd.read_csv(_path, header=None)
+                _frames.append(parse_promo_df(_raw))
+            except Exception:
+                pass
+
+    # 2. Google Sheets from config
+    if GSHEET_PROMO_URL:
+        try:
+            _frames.append(load_promo_from_gsheet(GSHEET_PROMO_URL))
+        except Exception:
+            pass
+
+    if _frames:
+        _combined = pd.concat(_frames, ignore_index=True).drop_duplicates(
+            subset=["date_start", "date_end", "promo_type"]
+        ).reset_index(drop=True)
+        st.session_state.promo_calendar  = _combined
+        st.session_state.promo_static_loaded = True
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 # ── Core helpers ──────────────────────────────────────────────────────────────
 
@@ -135,6 +166,16 @@ PROMO_TYPE_WEIGHT = {
 }
 PROMO_DEEP_TYPES = {"ТОВАР МІСЯЦЯ -40%", "1+1=3 на перелік",
                     "-50 на другу одиницю в чеку на перелік"}
+
+# ── Hardcoded config (set once, never needs UI) ───────────────────────────────
+# Файл з акціями за 2025 рік у репозиторії (відносний шлях від app.py)
+# Залиште порожнім "" якщо файлу немає
+STATIC_PROMO_FILE = "promo_2025.xlsx"   # або "promo_2025.csv"
+
+# Посилання на Google Таблицю з акціями 2026 (відкрита для перегляду)
+# Залиште порожнім "" щоб вводити вручну у вкладці Промокалендар
+GSHEET_PROMO_URL = ""   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def parse_promo_df(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -819,6 +860,7 @@ with tab4:
 
         exec_hist   = {}  # store -> [exec_pct, ...]
         exec_detail = {}  # store -> [(month, fact, plan, pct, plan_source_str), ...]
+        MIN_PLAN_FOR_REC = 1000   # ignore near-zero bootstrap plans in recommendations
 
         for month in last_n:
             for store in df.columns:
@@ -826,14 +868,14 @@ with tab4:
                 if pd.isna(fact_v) or fact_v == 0:
                     continue
                 excel_pv = excel_plans.get((store, month), 0)
-                if excel_pv > 0:
+                if excel_pv >= MIN_PLAN_FOR_REC:
                     pv = excel_pv
                     src_label = "Excel"
                 else:
                     pv = fallback_plans.get(store, {}).get(month, 0)
                     src_label = "авто"
-                if pv <= 0:
-                    continue
+                    if pv < MIN_PLAN_FOR_REC:
+                        continue   # skip months where plan was near-zero (new store ramp-up)
                 pct = fact_v / pv * 100
                 exec_hist.setdefault(store, []).append(pct)
                 exec_detail.setdefault(store, []).append(
@@ -842,7 +884,6 @@ with tab4:
 
         # ── Compute trend direction for each store (deseasoned last 6 months) ──
         def store_trend_pct(store):
-            """Monthly % change of deseasoned sales over last 6 months."""
             hist = df[store].replace(0, np.nan).dropna()
             hist = hist[hist.index < pm].iloc[-6:]
             if len(hist) < 3:
@@ -863,37 +904,46 @@ with tab4:
             start = store_starts.get(store)
             age   = ((today.year - start.year) * 12 + today.month - start.month) if start else 999
             detail_rows  = exec_detail.get(store, [])
-            trend_pct_mo = store_trend_pct(store)   # monthly % change
+            trend_pct_mo = store_trend_pct(store)
             trend_label  = (f"📈 зростає +{trend_pct_mo:.1f}%/міс" if trend_pct_mo > 1
                             else f"📉 спадає {trend_pct_mo:.1f}%/міс" if trend_pct_mo < -1
                             else "➡️ стабільний")
 
-            if avg > 115:
+            # New stores: use broader band ±25% (plans are inherently less accurate)
+            is_new = age < 12
+            threshold_high = 125 if is_new else 115
+            threshold_low  = 75  if is_new else 85
+
+            if avg > threshold_high:
                 gap = avg - 100
                 trend_note = (f" Тренд {trend_label} — план варто підняти агресивніше."
                               if trend_pct_mo > 1 else
                               f" Тренд {trend_label} — перевірте чи ріст не сповільнився.")
-                recs_low.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
-                    f"Середнє виконання {avg:.0f}% за {len(pcts)} міс. — план занижений на ≈{gap:.0f}%.{trend_note}"))
-
-            elif avg < 85:
-                gap = 100 - avg
-                if age < 12:
+                if is_new:
                     recs_new.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
-                        f"Новий магазин ({age} міс.), середнє виконання {avg:.0f}%. "
-                        f"Тренд: {trend_label}. Рекомендуємо план = поточний рівень × (1 + сезонний коеф.)."))
+                        f"Новий магазин ({age} міс.), виконання {avg:.0f}% — план занижений. "
+                        f"Тренд: {trend_label}. Рекомендуємо план = факт останнього місяця × (1 + сезонний коеф.)."))
                 else:
-                    trend_note = (f" Тренд {trend_label} — спад може продовжитись, знизити план."
+                    recs_low.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
+                        f"Середнє виконання {avg:.0f}% за {len(pcts)} міс. — план занижений на ≈{gap:.0f}%.{trend_note}"))
+
+            elif avg < threshold_low:
+                gap = 100 - avg
+                if is_new:
+                    recs_new.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
+                        f"Новий магазин ({age} міс.), виконання {avg:.0f}% — план завищений. "
+                        f"Тренд: {trend_label}. Рекомендуємо план = факт останнього місяця × (1 + сезонний коеф.)."))
+                else:
+                    trend_note = (f" Тренд {trend_label} — спад може продовжитись."
                                   if trend_pct_mo < -1 else
-                                  f" Тренд {trend_label} — можливо разові провали, перевірте деталі.")
+                                  f" Тренд {trend_label} — перевірте чи є разові причини.")
                     recs_high.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
                         f"Середнє виконання {avg:.0f}% за {len(pcts)} міс. — план завищений на ≈{gap:.0f}%.{trend_note}"))
 
             else:
-                # Plan is ±15% — but check if trend diverges significantly from plan
-                if abs(trend_pct_mo) > 3 and age >= 12:
-                    direction = "зростає" if trend_pct_mo > 0 else "спадає"
-                    action    = "підвищити" if trend_pct_mo > 0 else "знизити"
+                # Plan is within acceptable range — flag only strong trend divergence for mature stores
+                if abs(trend_pct_mo) > 3 and not is_new:
+                    action = "підвищити" if trend_pct_mo > 0 else "знизити"
                     recs_trend.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
                         f"Виконання в нормі ({avg:.0f}%), але тренд {trend_label} — "
                         f"варто {action} план на наступний місяць."))
@@ -1011,71 +1061,85 @@ with tab5:
     promo_df = st.session_state.promo_calendar
     has_promo = len(promo_df) > 0
 
-    # ── Section 1: Static 2025 calendar (uploaded once) ─────────────────────
-    st.markdown("**Постійний календар (2025 та попередні роки)**")
-    st.caption("Завантажте файл один раз — він зберігається в сесії до перезавантаження сторінки.")
+    # ── Status: auto-loaded sources ─────────────────────────────────────────
+    import os
+    _static_exists = bool(STATIC_PROMO_FILE and os.path.exists(
+        os.path.join(os.path.dirname(__file__), STATIC_PROMO_FILE)))
+    _gsheet_config = bool(GSHEET_PROMO_URL)
 
-    static_file = st.file_uploader(
-        "Завантажити Excel/CSV з промокалендарем",
-        type=["xlsx", "csv"],
-        key="promo_static_upload",
-        help="Формат: колонки ДАТА ПОЧАТКУ, ДАТА ЗАКІНЧЕННЯ, ТИП, НАЗВА (як у вашій таблиці)"
-    )
-    if static_file:
-        try:
-            if static_file.name.endswith(".csv"):
-                df_raw = pd.read_csv(static_file, header=None)
-            else:
-                df_raw = pd.read_excel(static_file, header=None)
-            parsed = parse_promo_df(df_raw)
-            st.session_state.promo_calendar = parsed
-            st.session_state.promo_static_loaded = True
-            promo_df = parsed
-            has_promo = True
-            st.success(f"✓ Завантажено {len(parsed)} акцій")
-        except Exception as e:
-            st.error(f"Помилка читання файлу: {e}")
-
-    st.markdown("---")
-
-    # ── Section 2: Google Sheets link ───────────────────────────────────────
-    st.markdown("**Поточний рік (Google Sheets)**")
-    st.caption(
-        "Відкрийте таблицю → Файл → Поділитися → Опублікувати в інтернеті → CSV. "
-        "Або вставте звичайне посилання /edit — застосунок перетворить його автоматично."
-    )
-
-    gsheet_url = st.text_input(
-        "Посилання на Google Таблицю",
-        placeholder="https://docs.google.com/spreadsheets/d/...",
-        key="gsheet_url_input"
-    )
-    if st.button("Завантажити з Google Sheets", use_container_width=False):
-        if gsheet_url.strip():
-            try:
-                with st.spinner("Завантаження..."):
-                    gdf = load_promo_from_gsheet(gsheet_url.strip())
-                # Merge with existing static data (avoid duplicates by date+type)
-                if has_promo:
-                    combined = pd.concat([promo_df, gdf], ignore_index=True)
-                    combined = combined.drop_duplicates(
-                        subset=["date_start", "date_end", "promo_type"]
-                    ).reset_index(drop=True)
-                else:
-                    combined = gdf
-                st.session_state.promo_calendar = combined
-                promo_df = combined
-                has_promo = True
-                st.success(f"✓ Додано {len(gdf)} акцій з Google Sheets (всього: {len(combined)})")
-            except requests.exceptions.HTTPError as e:
-                st.error(
-                    "Не вдалося отримати доступ. Переконайтесь що таблиця відкрита для перегляду: "
-                    "Файл → Поділитися → Будь-хто з посиланням може переглядати."
-                )
-            except Exception as e:
-                st.error(f"Помилка: {e}")
+    if _static_exists or _gsheet_config:
+        src_parts = []
+        if _static_exists:
+            src_parts.append(f"файл `{STATIC_PROMO_FILE}` з репозиторію")
+        if _gsheet_config:
+            src_parts.append("Google Таблиця з конфігу")
+        if has_promo:
+            st.success(f"✓ Промокалендар завантажено автоматично з: {', '.join(src_parts)} "
+                       f"({len(promo_df)} акцій)")
         else:
-            st.warning("Введіть посилання")
+            st.warning(f"Налаштовано джерела ({', '.join(src_parts)}), але завантаження не вдалось. "
+                       f"Завантажте вручну нижче.")
+    else:
+        st.info("Джерела промокалендаря не налаштовані в коді. "
+                "Завантажте вручну або додайте шлях/посилання в `STATIC_PROMO_FILE` / `GSHEET_PROMO_URL`.")
+
+    # ── Section 1: Manual upload (fallback / add extra data) ────────────────
+    with st.expander("Завантажити файл вручну (Excel/CSV)", expanded=not has_promo):
+        st.caption("Формат: колонки ДАТА ПОЧАТКУ, ДАТА ЗАКІНЧЕННЯ, ТИП, НАЗВА")
+        static_file = st.file_uploader(
+            "Файл з акціями",
+            type=["xlsx", "csv"],
+            key="promo_static_upload",
+        )
+        if static_file:
+            try:
+                _raw = pd.read_csv(static_file, header=None) if static_file.name.endswith(".csv")                        else pd.read_excel(static_file, header=None)
+                parsed = parse_promo_df(_raw)
+                if has_promo:
+                    merged = pd.concat([promo_df, parsed], ignore_index=True).drop_duplicates(
+                        subset=["date_start", "date_end", "promo_type"]).reset_index(drop=True)
+                else:
+                    merged = parsed
+                st.session_state.promo_calendar = merged
+                st.session_state.promo_static_loaded = True
+                promo_df = merged
+                has_promo = True
+                st.success(f"✓ Додано {len(parsed)} акцій (всього: {len(merged)})")
+            except Exception as e:
+                st.error(f"Помилка читання файлу: {e}")
+
+    # ── Section 2: Google Sheets link (manual override / refresh) ───────────
+    with st.expander("Оновити з Google Sheets вручну", expanded=not _gsheet_config):
+        st.caption(
+            "Таблиця має бути відкрита для перегляду: Файл → Поділитися → "
+            "Будь-хто з посиланням може переглядати."
+        )
+        default_url = GSHEET_PROMO_URL or ""
+        gsheet_url = st.text_input(
+            "Посилання на Google Таблицю",
+            value=default_url,
+            placeholder="https://docs.google.com/spreadsheets/d/...",
+            key="gsheet_url_input",
+        )
+        if st.button("Завантажити / оновити з Google Sheets"):
+            url_to_use = gsheet_url.strip() or GSHEET_PROMO_URL
+            if url_to_use:
+                try:
+                    with st.spinner("Завантаження..."):
+                        gdf = load_promo_from_gsheet(url_to_use)
+                    base = promo_df if has_promo else pd.DataFrame()
+                    combined = pd.concat([base, gdf], ignore_index=True).drop_duplicates(
+                        subset=["date_start", "date_end", "promo_type"]).reset_index(drop=True)
+                    st.session_state.promo_calendar = combined
+                    promo_df = combined
+                    has_promo = True
+                    st.success(f"✓ Оновлено: {len(gdf)} акцій з Google Sheets (всього: {len(combined)})")
+                except requests.exceptions.HTTPError:
+                    st.error("Немає доступу. Відкрийте таблицю для перегляду.")
+                except Exception as e:
+                    st.error(f"Помилка: {e}")
+            else:
+                st.warning("Введіть посилання")
 
     # ── Section 3: Preview and monthly summary ──────────────────────────────
     if has_promo:
