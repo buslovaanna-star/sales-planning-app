@@ -25,6 +25,7 @@ st.markdown("""
 for k, v in [
     ("df_fact", None), ("df_plan_auto", None), ("df_plan_edited", None),
     ("seasonality", None), ("store_starts", {}), ("plan_month", None),
+    ("excel_plans", {}),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -70,6 +71,50 @@ def parse_fact_sheet(xl):
 
     seasonality = parse_seasonality(xl)
     return df, store_starts, seasonality
+
+
+def parse_excel_plans(xl: dict) -> dict:
+    """
+    Extract store-level plan values from any available calc sheet.
+    Priority: розрахунки >рік+доповн > розрахунки >заг метрика похибки > розрахунки <рік
+    The 'заг метрика' sheet has 5 cols per store: fact, plan, deviation, APE, abs_dev
+    Returns dict: (store_name, month_timestamp) -> plan_value
+    """
+    plans = {}
+
+    # Sheet configs: (sheet_name, col_step, plan_col_offset, skip_keywords)
+    sheet_configs = [
+        ("розрахунки >рік+доповн",       5, 1, ["ПЛАН", "виконання"]),
+        ("розрахунки >заг метрика похибки", 5, 1, ["ПЛАН", "відхилення", "APE", "модуль"]),
+        ("розрахунки <рік",              5, 1, ["ПЛАН", "виконання"]),
+    ]
+
+    for sheet_name, step, plan_offset, skip_kw in sheet_configs:
+        df = xl.get(sheet_name)
+        if df is None:
+            continue
+        dates = pd.to_datetime(df.iloc[1:, 0], errors="coerce").reset_index(drop=True)
+        for c in range(1, df.shape[1], step):
+            store_raw = str(df.iloc[0, c])
+            if any(kw in store_raw for kw in skip_kw) or store_raw == "nan":
+                continue
+            store_name = store_raw.strip()
+            plan_col = c + plan_offset
+            if plan_col >= df.shape[1]:
+                continue
+            for i, d in enumerate(dates):
+                if pd.isna(d):
+                    continue
+                key = (store_name, d.to_period("M").to_timestamp())
+                if key in plans:   # already set by higher-priority sheet
+                    continue
+                try:
+                    v = float(df.iloc[i + 1, plan_col])
+                    if v > 0:
+                        plans[key] = v
+                except Exception:
+                    pass
+    return plans
 
 
 def deseasonalise(series: pd.Series, seasonality: dict) -> pd.Series:
@@ -193,6 +238,7 @@ with st.sidebar:
             st.session_state.df_fact = df_fact
             st.session_state.store_starts = store_starts
             st.session_state.seasonality = seasonality
+            st.session_state.excel_plans = parse_excel_plans(xl)
             st.success(f"✓ Завантажено {len(df_fact.columns)} магазинів")
 
     st.markdown("---")
@@ -475,81 +521,195 @@ with tab4:
         avail    = [m for m in has_data.index if m < pm]
         last_n   = avail[-6:] if len(avail) >= 6 else avail
 
-        # Build execution history
-        exec_hist = {}
+        # ── Build execution history: Excel plans first, app-plan as fallback ──
+        excel_plans = st.session_state.excel_plans
+        today = pd.Timestamp.today()
+
+        # Pre-compute app fallback plans for stores missing from Excel
+        fallback_plans = {}  # store -> {month -> plan_value}
+        stores_no_excel = set()
+        for store in df.columns:
+            for month in last_n:
+                fact_v = df.loc[month, store] if month in df.index else 0
+                if pd.isna(fact_v) or fact_v == 0:
+                    continue
+                if excel_plans.get((store, month), 0) == 0:
+                    stores_no_excel.add(store)
+        for store in stores_no_excel:
+            for month in last_n:
+                if fallback_plans.get(store, {}).get(month): continue
+                p = compute_auto_plan(
+                    df[df.index < month], store_starts, seasonality, month,
+                    growth_old=0.0, growth_young=0.15, age_threshold=12,
+                )
+                fallback_plans.setdefault(store, {})[month] = p.get(store, 0)
+
+        exec_hist   = {}  # store -> [exec_pct, ...]
+        exec_detail = {}  # store -> [(month, fact, plan, pct, plan_source_str), ...]
+
         for month in last_n:
-            plan_h = compute_auto_plan(
-                df[df.index < month], store_starts, seasonality, month,
-                growth_old=0.0, growth_young=0.15, age_threshold=12,
-            )
             for store in df.columns:
                 fact_v = df.loc[month, store] if month in df.index else 0
                 if pd.isna(fact_v) or fact_v == 0:
                     continue
-                pv = plan_h.get(store, 0)
-                if pv > 0:
-                    exec_hist.setdefault(store, []).append(fact_v / pv * 100)
+                excel_pv = excel_plans.get((store, month), 0)
+                if excel_pv > 0:
+                    pv = excel_pv
+                    src_label = "Excel"
+                else:
+                    pv = fallback_plans.get(store, {}).get(month, 0)
+                    src_label = "авто"
+                if pv <= 0:
+                    continue
+                pct = fact_v / pv * 100
+                exec_hist.setdefault(store, []).append(pct)
+                exec_detail.setdefault(store, []).append(
+                    (month, round(fact_v), round(pv), round(pct, 1), src_label)
+                )
 
-        recs_low, recs_high, recs_new = [], [], []
-        today = pd.Timestamp.today()
+        # ── Compute trend direction for each store (deseasoned last 6 months) ──
+        def store_trend_pct(store):
+            """Monthly % change of deseasoned sales over last 6 months."""
+            hist = df[store].replace(0, np.nan).dropna()
+            hist = hist[hist.index < pm].iloc[-6:]
+            if len(hist) < 3:
+                return 0.0
+            deseas = hist / hist.index.map(lambda d: seasonality.get(d.month, 1.0)) if seasonality else hist
+            x = np.arange(len(deseas), dtype=float)
+            slope, _ = np.polyfit(x, deseas.values.astype(float), 1)
+            return slope / deseas.mean() * 100 if deseas.mean() > 0 else 0.0
+
+        # ── Build recommendations ──
+        recs_low, recs_high, recs_new, recs_trend = [], [], [], []
 
         for store, pcts in exec_hist.items():
             if len(pcts) < 2:
                 continue
-            avg = np.mean(pcts)
-            name = store.replace("Магазин - ", "")
+            avg   = np.mean(pcts)
+            name  = store.replace("Магазин - ", "")
             start = store_starts.get(store)
-            age = ((today.year - start.year) * 12 + today.month - start.month) if start else 999
+            age   = ((today.year - start.year) * 12 + today.month - start.month) if start else 999
+            detail_rows  = exec_detail.get(store, [])
+            trend_pct_mo = store_trend_pct(store)   # monthly % change
+            trend_label  = (f"📈 зростає +{trend_pct_mo:.1f}%/міс" if trend_pct_mo > 1
+                            else f"📉 спадає {trend_pct_mo:.1f}%/міс" if trend_pct_mo < -1
+                            else "➡️ стабільний")
 
             if avg > 115:
-                recs_low.append((name, avg, len(pcts),
-                    f"Середнє виконання {avg:.0f}% за {len(pcts)} міс. — план хронічно занижений. "
-                    f"Рекомендуємо підвищити на ≈{avg-100:.0f}%."))
-            elif avg < 85:
-                if age < 12:
-                    recs_new.append((name, avg, len(pcts),
-                        f"Новий магазин ({age} міс.), середнє виконання {avg:.0f}% — "
-                        f"рекомендуємо консервативний план (+5–10% від поточного рівня)."))
-                else:
-                    recs_high.append((name, avg, len(pcts),
-                        f"Середнє виконання {avg:.0f}% за {len(pcts)} міс. — план стабільно завищений. "
-                        f"Рекомендуємо знизити на ≈{100-avg:.0f}%."))
+                gap = avg - 100
+                trend_note = (f" Тренд {trend_label} — план варто підняти агресивніше."
+                              if trend_pct_mo > 1 else
+                              f" Тренд {trend_label} — перевірте чи ріст не сповільнився.")
+                recs_low.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
+                    f"Середнє виконання {avg:.0f}% за {len(pcts)} міс. — план занижений на ≈{gap:.0f}%.{trend_note}"))
 
-        total = len(recs_low) + len(recs_high) + len(recs_new)
-        st.markdown(f"Знайдено **{total} рекомендацій** на основі останніх **{len(last_n)} місяців**")
+            elif avg < 85:
+                gap = 100 - avg
+                if age < 12:
+                    recs_new.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
+                        f"Новий магазин ({age} міс.), середнє виконання {avg:.0f}%. "
+                        f"Тренд: {trend_label}. Рекомендуємо план = поточний рівень × (1 + сезонний коеф.)."))
+                else:
+                    trend_note = (f" Тренд {trend_label} — спад може продовжитись, знизити план."
+                                  if trend_pct_mo < -1 else
+                                  f" Тренд {trend_label} — можливо разові провали, перевірте деталі.")
+                    recs_high.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
+                        f"Середнє виконання {avg:.0f}% за {len(pcts)} міс. — план завищений на ≈{gap:.0f}%.{trend_note}"))
+
+            else:
+                # Plan is ±15% — but check if trend diverges significantly from plan
+                if abs(trend_pct_mo) > 3 and age >= 12:
+                    direction = "зростає" if trend_pct_mo > 0 else "спадає"
+                    action    = "підвищити" if trend_pct_mo > 0 else "знизити"
+                    recs_trend.append((name, avg, len(pcts), detail_rows, trend_pct_mo,
+                        f"Виконання в нормі ({avg:.0f}%), але тренд {trend_label} — "
+                        f"варто {action} план на наступний місяць."))
+
+        total = len(recs_low) + len(recs_high) + len(recs_new) + len(recs_trend)
+        n_excel = sum(1 for (s, m), v in excel_plans.items() if v > 0)
+        st.markdown(
+            f"Знайдено **{total} рекомендацій** на основі **{len(last_n)} місяців** "
+            f"({n_excel} планових значень з Excel, {len(stores_no_excel)} магазинів — авто-план)"
+        )
+
+        def _render_detail(detail_rows):
+            if not detail_rows:
+                return
+            has_src = len(detail_rows[0]) == 5
+            rows_html = ""
+            for row in sorted(detail_rows, key=lambda x: x[0]):
+                m, fact, plan, pct = row[0], row[1], row[2], row[3]
+                src_lbl = row[4] if has_src else ""
+                clr = "#2e7d32" if pct >= 100 else "#e65100" if pct >= 85 else "#c62828"
+                src_badge = (f"<span style='font-size:10px;padding:1px 5px;border-radius:3px;"
+                             f"background:#e3e3e3;color:#555;margin-left:4px'>{src_lbl}</span>"
+                             if src_lbl else "")
+                rows_html += (
+                    f"<tr>"
+                    f"<td style='padding:2px 10px 2px 0;color:var(--color-text-secondary);font-size:12px'>{m.strftime('%b %Y')}</td>"
+                    f"<td style='padding:2px 10px 2px 0;font-size:12px'>{fact:,}</td>"
+                    f"<td style='padding:2px 10px 2px 0;font-size:12px'>{plan:,}{src_badge}</td>"
+                    f"<td style='padding:2px 0;font-size:12px;font-weight:500;color:{clr}'>{pct:.0f}%</td>"
+                    f"</tr>"
+                )
+            st.markdown(
+                f"<table style='margin-top:6px'>"
+                f"<tr>"
+                f"<th style='padding:2px 10px 2px 0;font-size:11px;color:var(--color-text-secondary)'>Місяць</th>"
+                f"<th style='padding:2px 10px 2px 0;font-size:11px;color:var(--color-text-secondary)'>Факт</th>"
+                f"<th style='padding:2px 10px 2px 0;font-size:11px;color:var(--color-text-secondary)'>План</th>"
+                f"<th style='padding:2px 0;font-size:11px;color:var(--color-text-secondary)'>Вик.%</th>"
+                f"</tr>{rows_html}</table>",
+                unsafe_allow_html=True
+            )
 
         if recs_low:
             with st.expander(f"🔼 План занижений — {len(recs_low)} магазин(и)", expanded=True):
-                for name, avg, n, msg in sorted(recs_low, key=lambda x: -x[1]):
+                for name, avg, n, detail_rows, trend_pct, msg in sorted(recs_low, key=lambda x: -x[1]):
                     st.markdown(
                         f'<div class="rec-card rec-low">'
                         f'<strong>{name}</strong> — виконання {avg:.0f}%<br>'
                         f'<span style="font-size:0.9rem">{msg}</span></div>',
                         unsafe_allow_html=True
                     )
+                    _render_detail(detail_rows)
 
         if recs_high:
             with st.expander(f"🔽 План завищений — {len(recs_high)} магазин(и)", expanded=True):
-                for name, avg, n, msg in sorted(recs_high, key=lambda x: x[1]):
+                for name, avg, n, detail_rows, trend_pct, msg in sorted(recs_high, key=lambda x: x[1]):
                     st.markdown(
                         f'<div class="rec-card rec-high">'
                         f'<strong>{name}</strong> — виконання {avg:.0f}%<br>'
                         f'<span style="font-size:0.9rem">{msg}</span></div>',
                         unsafe_allow_html=True
                     )
+                    _render_detail(detail_rows)
 
         if recs_new:
             with st.expander(f"🆕 Нові магазини — {len(recs_new)} магазин(и)", expanded=True):
-                for name, avg, n, msg in sorted(recs_new, key=lambda x: x[1]):
+                for name, avg, n, detail_rows, trend_pct, msg in sorted(recs_new, key=lambda x: x[1]):
                     st.markdown(
                         f'<div class="rec-card rec-new">'
                         f'<strong>{name}</strong> — виконання {avg:.0f}%<br>'
                         f'<span style="font-size:0.9rem">{msg}</span></div>',
                         unsafe_allow_html=True
                     )
+                    _render_detail(detail_rows)
+
+        if recs_trend:
+            with st.expander(f"📈 Тренд розходиться з планом — {len(recs_trend)} магазин(и)", expanded=True):
+                for name, avg, n, detail_rows, trend_pct, msg in sorted(recs_trend, key=lambda x: -abs(x[4])):
+                    clr = "rec-low" if trend_pct > 0 else "rec-high"
+                    st.markdown(
+                        f'<div class="rec-card {clr}">'
+                        f'<strong>{name}</strong> — виконання {avg:.0f}%, тренд {trend_pct:+.1f}%/міс<br>'
+                        f'<span style="font-size:0.9rem">{msg}</span></div>',
+                        unsafe_allow_html=True
+                    )
+                    _render_detail(detail_rows)
 
         if total == 0:
-            st.success("✅ Всі магазини виконують план у нормі (85–115%). Рекомендацій немає.")
+            st.success("✅ Всі магазини виконують план у нормі (85–115%) і тренд відповідає плану. Рекомендацій немає.")
 
         # ── Store age table ──────────────────────────────────────────────────
         st.markdown("---")
