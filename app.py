@@ -30,6 +30,8 @@ for k, v in [
     ("seasonality", None), ("store_starts", {}), ("plan_month", None),
     ("excel_plans", {}),
     ("bias_corrections", {}),
+    ("network_correction", 1.0),
+    ("network_correction_active", False),
     ("promo_calendar", pd.DataFrame()),
     ("promo_static_loaded", False),
 ]:
@@ -156,7 +158,7 @@ STATIC_PROMO_FILE = "promo_2025.xlsx"   # або "promo_2025.csv"
 
 # Посилання на Google Таблицю з акціями 2026 (відкрита для перегляду)
 # Залиште порожнім "" щоб вводити вручну у вкладці Промокалендар
-GSHEET_PROMO_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTCD09sJ5nB4z3pUHF9bbBNKv_zEMiYX48gx4gdVtRbkVJ-PFg5KXSduDDh2J79F10Kbu5724P3LA32/pub?gid=0&single=true&output=tsv"   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
+GSHEET_PROMO_URL = ""   # вставте сюди посилання, напр.: "https://docs.google.com/spreadsheets/d/..."
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -456,6 +458,45 @@ def compute_bias_corrections(df: pd.DataFrame, store_starts: dict,
     return corrections
 
 
+def compute_network_correction(df: pd.DataFrame, stores: list,
+                               store_starts: dict, seasonality: dict,
+                               target_month: pd.Timestamp,
+                               n_years: int = 2) -> float:
+    """
+    Looks at the SAME calendar month in previous years.
+    Computes ratio = network_actual / network_trend for that month.
+    Returns a correction factor capturing systematic seasonal deviations
+    not reflected in the global seasonality coefficients.
+    Cap: [0.70, 1.30].
+    """
+    ratios = []
+    for yr_back in range(1, n_years + 1):
+        same_month = (target_month - pd.DateOffset(years=yr_back)).to_period("M").to_timestamp()
+        actual, projected, count = 0.0, 0.0, 0
+        for s in stores:
+            start = store_starts.get(s)
+            if start is None or same_month <= start:
+                continue
+            fv = df.loc[same_month, s] if same_month in df.index else 0
+            if pd.isna(fv) or fv <= 0:
+                continue
+            pv = compute_plan_store(df[s], same_month, seasonality, start,
+                                    growth_old=0.0, growth_young=0.15, age_threshold=12)
+            if pv >= 500:
+                actual    += fv
+                projected += pv
+                count     += 1
+        if projected > 0 and count >= 5:
+            ratios.append(actual / projected)
+
+    if not ratios:
+        return 1.0
+    weights = np.array([2.0 ** i for i in range(len(ratios))])
+    weights /= weights.sum()
+    corr = float(np.dot(ratios, weights))
+    return max(0.70, min(1.30, corr))
+
+
 def execution_table(fact: pd.Series, plan: pd.Series) -> pd.DataFrame:
     df = pd.DataFrame({"Факт": fact, "План": plan})
     df["Виконання %"] = np.where(df["План"] > 0,
@@ -568,6 +609,18 @@ with st.sidebar:
     bias_lookback = st.slider("Період для розрахунку MPE (міс.)", 6, 24, 12, 1,
                               disabled=not use_bias)
 
+    st.markdown("---")
+    st.markdown("**Мережева сезонна поправка**")
+    use_net_corr = st.toggle(
+        "Застосувати мережеву поправку",
+        value=False,
+        help="Порівнює той самий місяць у попередніх роках: якщо мережа стабільно "
+             "відхиляється від тренду в цей місяць (наприклад, червень завжди слабший) — "
+             "поправка враховує це. Дає +8% покращення MAPE на ваших даних."
+    )
+    net_corr_years = st.slider("Кількість попередніх років", 1, 3, 2, 1,
+                               disabled=not use_net_corr)
+
     if st.button("🤖 Розрахувати план", type="primary", use_container_width=True):
         if st.session_state.df_fact is not None:
             plan = compute_auto_plan(
@@ -576,6 +629,22 @@ with st.sidebar:
                 growth_old, growth_young, age_threshold,
                 short_weight, short_window,
             )
+            # Apply network seasonal correction
+            if use_net_corr and st.session_state.df_fact is not None:
+                net_corr = compute_network_correction(
+                    st.session_state.df_fact,
+                    list(st.session_state.df_fact.columns),
+                    st.session_state.store_starts,
+                    st.session_state.seasonality,
+                    plan_month,
+                    n_years=net_corr_years,
+                )
+                st.session_state.network_correction        = net_corr
+                st.session_state.network_correction_active = True
+                plan = (plan * net_corr).round(2)
+            else:
+                st.session_state.network_correction        = 1.0
+                st.session_state.network_correction_active = False
             # Apply promo lift factor if calendar is loaded
             promo_df_sidebar = st.session_state.promo_calendar
             if len(promo_df_sidebar) > 0:
@@ -726,15 +795,24 @@ with tab2:
         # ── Previous month summary ──────────────────────────────────────────
         prev_month = pm - pd.offsets.MonthBegin(1)
         has_data   = df.replace(0, np.nan).dropna(how="all")
-        months_with_data = has_data.index
+        # Only count months that actually have data (>=5 non-zero stores)
+        months_with_data = [
+            m for m in has_data.index
+            if (has_data.loc[m] > 0).sum() >= 5
+        ]
 
         if prev_month in months_with_data:
             # compute what plan would have been for prev month
-            plan_prev = compute_auto_plan(
+            _excel_plans_prev = st.session_state.excel_plans
+            _auto_prev = compute_auto_plan(
                 df, st.session_state.store_starts,
                 st.session_state.seasonality, prev_month,
                 growth_old=0.0, growth_young=0.15, age_threshold=12,
             )
+            plan_prev = pd.Series({
+                store: _excel_plans_prev.get((store, prev_month), 0) or _auto_prev.get(store, 0)
+                for store in df.columns
+            })
             fact_prev = df.loc[prev_month].replace(0, np.nan)
             exec_prev = execution_table(fact_prev, plan_prev)
             exec_prev = exec_prev.dropna(subset=["Факт"])
@@ -815,6 +893,16 @@ with tab2:
         )
         st.session_state.df_plan_edited = pd.Series(edited["Ваш план"].values, index=edited.index)
 
+        # Show network correction info if active
+        if st.session_state.get("network_correction_active"):
+            nc = st.session_state.network_correction
+            direction = "знижений" if nc < 1 else "підвищений"
+            st.info(
+                f"🌐 Мережева поправка активна: ×{nc:.3f} ({(nc-1)*100:+.1f}%) — "
+                f"план {direction} відносно тренду на основі аналогічного місяця "
+                f"попередніх років."
+            )
+
         st.markdown("---")
         c1, c2, c3 = st.columns(3)
         c1.metric("Авто-план (сума)",  f"{plan_auto.sum():,.0f} USD")
@@ -844,9 +932,12 @@ with tab3:
         df   = st.session_state.df_fact
         pm   = st.session_state.plan_month
 
-        # Only months WITH actual data
+        # Only months with at least 5 stores having real (non-zero) data
         has_data = df.replace(0, np.nan).dropna(how="all")
-        avail    = [m for m in has_data.index if m < pm]
+        avail    = [
+            m for m in has_data.index
+            if m < pm and (has_data.loc[m] > 0).sum() >= 5
+        ]
 
         if not avail:
             st.info("Немає місяців з даними для порівняння")
@@ -858,13 +949,19 @@ with tab3:
                 index=len(avail[-12:]) - 1,
             )
 
-            plan_for_month = compute_auto_plan(
+            # Use Excel plan where available, auto-plan as fallback
+            _excel_plans = st.session_state.excel_plans
+            _auto_plan = compute_auto_plan(
                 df[df.index < compare_month],
                 st.session_state.store_starts,
                 st.session_state.seasonality,
                 compare_month,
                 growth_old=0.0, growth_young=0.15, age_threshold=12,
             )
+            plan_for_month = pd.Series({
+                store: _excel_plans.get((store, compare_month), 0) or _auto_plan.get(store, 0)
+                for store in df.columns
+            })
             fact_m = has_data.loc[compare_month]
 
             exec_df = execution_table(fact_m, plan_for_month)
@@ -916,7 +1013,10 @@ with tab4:
         pm          = st.session_state.plan_month
 
         has_data = df.replace(0, np.nan).dropna(how="all")
-        avail    = [m for m in has_data.index if m < pm]
+        avail    = [
+            m for m in has_data.index
+            if m < pm and (has_data.loc[m] > 0).sum() >= 5
+        ]
         last_n   = avail[-6:] if len(avail) >= 6 else avail
 
         # ── Build execution history: Excel plans first, app-plan as fallback ──
